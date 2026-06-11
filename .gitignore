@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+
+# Local OAuth token cache. The app stores this outside the repo by default.
+.kggm-assistant/
+
+# User-downloaded Google OAuth client secrets.
+client_secret*.json
+
+# Separate repository kept next to this example while publishing.
+gemma4-hermes-agent-setup/
