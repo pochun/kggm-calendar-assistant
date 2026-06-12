@@ -20,7 +20,8 @@ open -a Ollama
 Run the app:
 
 ```bash
-cd "/Users/pochunhsu/Documents/KGGM home assistant"
+git clone https://github.com/pochun/kggm-calendar-assistant.git
+cd kggm-calendar-assistant
 python3 assistant_app.py
 ```
 
