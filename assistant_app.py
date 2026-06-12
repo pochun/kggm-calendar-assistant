@@ -30,6 +30,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
+REQUIRED_QUERY_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 SESSION = {
     "messages": [],
     "pending_event": None,
@@ -298,10 +299,11 @@ INDEX_HTML = r"""<!doctype html>
       const data = await res.json();
       document.getElementById("ollamaStatus").textContent = data.ollama.ok ? "Ready" : "Offline";
       document.getElementById("ollamaStatus").className = data.ollama.ok ? "ok" : "bad";
-      document.getElementById("googleStatus").textContent = data.google.connected ? "Connected" : "Not connected";
-      document.getElementById("googleStatus").className = data.google.connected ? "ok" : "bad";
+      const googleReady = data.google.connected && !data.google.needsReconnect;
+      document.getElementById("googleStatus").textContent = googleReady ? "Connected" : (data.google.connected ? "Reconnect needed" : "Not connected");
+      document.getElementById("googleStatus").className = googleReady ? "ok" : "bad";
       document.getElementById("modelName").textContent = data.model;
-      connectBtn.style.display = data.google.connected ? "none" : "block";
+      connectBtn.style.display = googleReady ? "none" : "block";
     }
 
     connectBtn.addEventListener("click", () => {
@@ -426,6 +428,28 @@ def google_configured():
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
 
+def token_scopes(token=None):
+    token = token if token is not None else load_token()
+    return set((token.get("scope") or "").split())
+
+
+def missing_query_scopes():
+    if not token_exists():
+        return []
+    scopes = token_scopes()
+    return [] if REQUIRED_QUERY_SCOPE in scopes else [REQUIRED_QUERY_SCOPE]
+
+
+def google_status():
+    missing = missing_query_scopes()
+    return {
+        "configured": google_configured(),
+        "connected": token_exists(),
+        "needsReconnect": bool(missing),
+        "missingScopes": missing,
+    }
+
+
 def google_auth_url():
     if not google_configured():
         raise RuntimeError("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET first.")
@@ -493,22 +517,43 @@ def create_google_event(event):
 
 def list_google_events(time_min, time_max, query=""):
     access_token = valid_access_token()
-    calendar_id = urllib.parse.quote(GOOGLE_CALENDAR_ID, safe="")
-    params = {
-        "timeMin": time_min,
-        "timeMax": time_max,
-        "singleEvents": "true",
-        "orderBy": "startTime",
-        "maxResults": "20",
-    }
-    if query:
-        params["q"] = query
-    url = f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events?{urllib.parse.urlencode(params)}"
+    events = []
+    for calendar in calendar_targets(access_token):
+        calendar_id = urllib.parse.quote(calendar["id"], safe="")
+        params = {
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxResults": "20",
+        }
+        if query:
+            params["q"] = query
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events?{urllib.parse.urlencode(params)}"
+        data = http_json(url, headers={"Authorization": f"Bearer {access_token}"})
+        for item in data.get("items", []):
+            events.append(format_calendar_event(item, calendar.get("summary", "")))
+    events.sort(key=lambda item: item.get("start", ""))
+    return events[:20]
+
+
+def calendar_targets(access_token):
+    if GOOGLE_CALENDAR_ID != "primary":
+        return [{"id": GOOGLE_CALENDAR_ID, "summary": GOOGLE_CALENDAR_ID}]
+    missing = missing_query_scopes()
+    if missing:
+        raise RuntimeError("Google Calendar 權限需要更新。請按左側 Connect Google Calendar 重新連接一次，授權讀取行事曆後才能查詢既有行程。")
+    url = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
     data = http_json(url, headers={"Authorization": f"Bearer {access_token}"})
-    return [format_calendar_event(item) for item in data.get("items", [])]
+    calendars = [
+        {"id": item["id"], "summary": item.get("summary", item["id"])}
+        for item in data.get("items", [])
+        if item.get("selected") or item.get("primary")
+    ]
+    return calendars or [{"id": "primary", "summary": "primary"}]
 
 
-def format_calendar_event(item):
+def format_calendar_event(item, calendar_summary=""):
     start = item.get("start", {})
     end = item.get("end", {})
     return {
@@ -518,6 +563,7 @@ def format_calendar_event(item):
         "end": end.get("dateTime") or end.get("date", ""),
         "location": item.get("location", ""),
         "htmlLink": item.get("htmlLink", ""),
+        "calendar": calendar_summary,
     }
 
 
@@ -661,6 +707,26 @@ def parse_relative_day(text):
     return None
 
 
+def query_range(text):
+    start_today, _ = day_bounds(0)
+    two_day_words = ["今天與明天", "今天和明天", "今天、明天", "今天明天", "這兩天", "接下來兩天", "未來兩天"]
+    if any(word in text for word in two_day_words):
+        return start_today, start_today + dt.timedelta(days=2)
+    match = re.search(r"(?:接下來|未來)(\d+)\s*天", text)
+    if match:
+        days = max(1, min(int(match.group(1)), 14))
+        return start_today, start_today + dt.timedelta(days=days)
+    match = re.search(r"(?:接下來|未來)(一|二|兩|三|四|五|六|七|八|九|十)\s*天", text)
+    if match:
+        days = chinese_number_to_int(match.group(1))
+        if days:
+            return start_today, start_today + dt.timedelta(days=min(days, 14))
+    day_offset = parse_relative_day(text)
+    if day_offset is None:
+        return None
+    return day_bounds(day_offset)
+
+
 def apply_day_part(text, start, end):
     if any(word in text for word in ["早上", "上午", "明早"]):
         return start.replace(hour=6), start.replace(hour=12)
@@ -677,11 +743,12 @@ def fast_query(text):
     query_words = ["行程", "有什麼", "有哪些", "查", "看看", "空嗎", "忙嗎"]
     if not any(word in text for word in query_words):
         return None
-    day_offset = parse_relative_day(text)
-    if day_offset is None:
+    date_range = query_range(text)
+    if date_range is None:
         return None
-    start, end = day_bounds(day_offset)
-    start, end = apply_day_part(text, start, end)
+    start, end = date_range
+    if (end - start) <= dt.timedelta(days=1):
+        start, end = apply_day_part(text, start, end)
     return {
         "timeMin": start.isoformat(timespec="seconds"),
         "timeMax": end.isoformat(timespec="seconds"),
@@ -803,7 +870,12 @@ def handle_user_message(user_text):
 
     quick_query = fast_query(user_text)
     if quick_query:
-        events = list_google_events(quick_query["timeMin"], quick_query["timeMax"], quick_query.get("q", ""))
+        try:
+            events = list_google_events(quick_query["timeMin"], quick_query["timeMax"], quick_query.get("q", ""))
+        except RuntimeError as exc:
+            reply = str(exc)
+            remember("assistant", reply)
+            return {"action": "ask", "reply": reply, "questions": []}
         reply = reply_for_events(events, quick_query)
         remember("assistant", reply)
         return {"action": "query", "reply": reply, "events": events, "query": quick_query}
@@ -821,7 +893,12 @@ def handle_user_message(user_text):
         reply = "可以，請告訴我這個活動的日期、時間，還有需要的話地點與多久。"
         remember("assistant", reply)
         return {"action": "ask", "reply": reply, "questions": ["日期與開始時間是什麼？"]}
-    parsed = plan_with_ollama(user_text)
+    try:
+        parsed = plan_with_ollama(user_text)
+    except Exception:
+        reply = "我這句沒有穩定解析成功。請換個更明確的說法，例如「今天與明天有哪些行程」或「明天下午三點加一個牙醫」。"
+        remember("assistant", reply)
+        return {"action": "ask", "reply": reply, "questions": []}
     action = parsed.get("action")
 
     if action == "propose":
@@ -833,7 +910,12 @@ def handle_user_message(user_text):
 
     if action == "query":
         query = parsed.get("query", {})
-        events = list_google_events(query["timeMin"], query["timeMax"], query.get("q", ""))
+        try:
+            events = list_google_events(query["timeMin"], query["timeMax"], query.get("q", ""))
+        except RuntimeError as exc:
+            reply = str(exc)
+            remember("assistant", reply)
+            return {"action": "ask", "reply": reply, "questions": []}
         model_reply = parsed.get("reply") or ""
         result_reply = reply_for_events(events, query)
         reply = result_reply if not model_reply else f"{model_reply}\n{result_reply}"
@@ -874,7 +956,7 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 200, {
                 "model": MODEL,
                 "ollama": ollama_status(),
-                "google": {"configured": google_configured(), "connected": token_exists()},
+                "google": google_status(),
             })
         elif path == "/auth/google":
             try:
