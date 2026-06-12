@@ -1,6 +1,6 @@
 # KGGM Local Calendar Assistant
 
-Local web assistant for turning natural language into Google Calendar events.
+Local web assistant for querying Google Calendar and turning natural language into events.
 
 It uses:
 
@@ -8,6 +8,12 @@ It uses:
 - Local model `gemma4-agent-12b`
 - Google Calendar OAuth
 - No paid AI API tokens
+
+It supports:
+
+- multi-turn event completion
+- existing event lookup
+- event preview before creation
 
 ## Start
 
@@ -54,6 +60,8 @@ python3 assistant_app.py
 
 Then click `Connect Google Calendar` in the web UI.
 
+If you previously connected an older version of the app, reconnect once so Google grants the read scope needed for calendar lookup.
+
 OAuth tokens are stored outside this repo:
 
 ```text
@@ -65,8 +73,26 @@ OAuth tokens are stored outside this repo:
 - Events are not created immediately.
 - The app first shows an event preview.
 - You must click `Create Event` before it writes to Google Calendar.
-- The app asks only for `https://www.googleapis.com/auth/calendar.events`.
+- The app asks for Google Calendar event read/create permissions:
+  - `https://www.googleapis.com/auth/calendar.events`
+  - `https://www.googleapis.com/auth/calendar.readonly`
 - It does not use OpenAI, OpenRouter, Anthropic, or other paid AI APIs.
+
+## Example Prompts
+
+```text
+明天上午我有什麼行程？
+```
+
+```text
+幫我加一個牙醫
+```
+
+Then answer the follow-up:
+
+```text
+明天下午三點，在台大醫院，一小時
+```
 
 ## Optional Settings
 
